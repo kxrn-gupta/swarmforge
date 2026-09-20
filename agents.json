@@ -24,7 +24,7 @@
       "install": {
         "curl": "curl -fsSL https://antigravity.google/cli/install.sh | bash"
       },
-      "roles": ["planner", "scaffolder", "coder", "fixer"]
+      "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"]
     },
     "gemini": {
       "binary": "gemini",
@@ -54,14 +54,14 @@
       "install": {
         "npm": "npm i -g @github/copilot"
       },
-      "roles": ["coder", "fixer"]
+      "roles": ["coder", "reviewer", "fixer"]
     }
   },
   "roles": {
     "planner": { "providers": ["opencode", "grok", "agy"] },
     "scaffolder": { "providers": ["opencode", "grok", "agy"] },
     "coder": { "providers": ["opencode", "grok", "agy", "gemini", "copilot"] },
-    "reviewer": { "providers": ["grok", "opencode", "gemini"] },
+    "reviewer": { "providers": ["opencode", "agy", "gemini", "grok", "copilot"] },
     "fixer": { "providers": ["opencode", "agy", "copilot"] }
   }
 }

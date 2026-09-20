@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
                           "%LOCALAPPDATA%/agy/bin/agy.exe",
                           "%LOCALAPPDATA%/Programs/antigravity/resources/agy.exe"],
             },
-            "roles": ["planner", "scaffolder", "coder", "fixer"],
+            "roles": ["planner", "scaffolder", "coder", "reviewer", "fixer"],
         },
         "gemini": {
             "binary": "gemini",
@@ -102,14 +102,14 @@ DEFAULT_CONFIG = {
             "install": {"npm": "npm i -g @github/copilot"},
             "auto_install": {"method": "npm", "package": "@github/copilot",
                              "binary": "copilot"},
-            "roles": ["coder", "fixer"],
+            "roles": ["coder", "reviewer", "fixer"],
         },
     },
     "roles": {
         "planner": {"providers": ["opencode", "grok", "agy"]},
         "scaffolder": {"providers": ["opencode", "grok", "agy"]},
         "coder": {"providers": ["opencode", "grok", "agy", "gemini", "copilot"]},
-        "reviewer": {"providers": ["grok", "opencode", "gemini"]},
+        "reviewer": {"providers": ["opencode", "agy", "gemini", "grok", "copilot"]},
         "fixer": {"providers": ["opencode", "agy", "copilot"]},
     },
 }
@@ -319,6 +319,46 @@ def _expand(path: str) -> str:
     return s.replace("/", os.sep)
 
 
+def is_provider_authenticated(name: str, info: dict) -> tuple[bool, str]:
+    """Check if the provider CLI has credentials configured (fast, non-blocking)."""
+    try:
+        home = Path.home()
+    except Exception:
+        home = None
+
+    if name == "gemini":
+        if os.environ.get("GEMINI_API_KEY"):
+            return True, "GEMINI_API_KEY detected"
+        if home:
+            gemini_dir = home / ".gemini"
+            if gemini_dir.exists():
+                for f in ("oauth_creds.json", "google_accounts.json", "settings.json"):
+                    fp = gemini_dir / f
+                    if fp.exists() and fp.stat().st_size > 5:
+                        return True, f"Credentials in {f}"
+        return False, "Missing GEMINI_API_KEY or login (`gemini login`)"
+
+    if name == "copilot":
+        copilot_paths = []
+        if home:
+            copilot_paths.append(home / ".config" / "github-copilot" / "hosts.json")
+        for env_k in ("LOCALAPPDATA", "APPDATA"):
+            val = os.environ.get(env_k)
+            if val:
+                copilot_paths.append(Path(val) / "github-copilot" / "hosts.json")
+        for cp in copilot_paths:
+            try:
+                if cp.exists() and cp.stat().st_size > 5:
+                    return True, "GitHub Copilot auth found"
+            except Exception:
+                pass
+        if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+            return True, "GitHub token detected"
+        return False, "Not authenticated (`copilot auth` or `gh auth login`)"
+
+    return True, ""
+
+
 def detect(cfg: dict) -> dict:
     desktop = desktop_apps()
     out = {}
@@ -340,6 +380,9 @@ def detect(cfg: dict) -> dict:
             if found:
                 info["available"] = True
                 info["path"] = found
+        authed, note = is_provider_authenticated(name, info)
+        info["authenticated"] = authed
+        info["auth_note"] = note
         out[name] = info
     return out
 
@@ -520,11 +563,13 @@ def build_command(provider: dict, prompt: str, model: str | None = None) -> list
     cmd = list(provider.get("command", []))
     if provider.get("path"):
         cmd[0] = provider["path"]
-    is_agy = provider.get("binary") == "agy" or (bool(cmd) and Path(cmd[0]).stem.lower() == "agy")
-    agy_p = False
-    if is_agy and "-p" in cmd:
+    prompt_flag = provider.get("prompt_flag")
+    if "-p" in cmd:
         cmd.remove("-p")
-        agy_p = True
+        prompt_flag = "-p"
+    elif "--prompt" in cmd:
+        cmd.remove("--prompt")
+        prompt_flag = "--prompt"
     if provider.get("approve", True):
         cmd += list(provider.get("approve_flags", []))
     model_flag = provider.get("model_flag", [])
@@ -532,8 +577,8 @@ def build_command(provider: dict, prompt: str, model: str | None = None) -> list
         model = provider.get("model")
     if model and model_flag:
         cmd += list(model_flag) + [model]
-    if agy_p or provider.get("prompt_flag"):
-        cmd += ["-p"]
+    if prompt_flag:
+        cmd.append(prompt_flag)
     cmd.append(prompt)
     return cmd
 
@@ -605,6 +650,9 @@ def pick_provider(role: str, avail: dict, used: dict, cfg: dict):
         candidates = list(avail.keys())
     if not candidates:
         return None
+    authed = [p for p in candidates if avail[p].get("authenticated", True)]
+    if authed:
+        candidates = authed
     idx = used.get(role, 0)
     used[role] = idx + 1
     return candidates[idx % len(candidates)]
@@ -984,18 +1032,30 @@ def plan_phase(cfg, avail, used, task, shared, timeout, status, models=None):
     pname = pick_provider("planner", avail, used, cfg)
     if not pname:
         return None
-    p = avail[pname]
-    prompt = role_prompt(cfg, "planner", task=task, shared=str(shared))
-    status.log(f"planner -> {pname}")
-    res = run_agent(p, prompt, shared, timeout, "planner", (models or {}).get("planner"))
-    (shared / "planner.log").write_text(
-        res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
-    subtasks = parse_subtasks(res["stdout"])
-    if not subtasks and res.get("returncode") != 0:
+    tried = set()
+    while pname and pname not in tried:
+        tried.add(pname)
+        p = avail[pname]
+        prompt = role_prompt(cfg, "planner", task=task, shared=str(shared))
+        print(f"[plan]  Planning task with '{pname}' (decomposing into DAG)...")
+        status.log(f"planner -> {pname}")
+        res = run_agent(p, prompt, shared, timeout, "planner", (models or {}).get("planner"))
+        (shared / "planner.log").write_text(
+            res["stdout"] + "\n--- stderr ---\n" + res["stderr"], encoding="utf-8")
+        subtasks = parse_subtasks(res["stdout"])
+        if subtasks:
+            return subtasks
         err = res.get("stderr", "").strip() or res.get("stdout", "").strip()
         first_line = err.splitlines()[0][:140] if err else f"exit code {res.get('returncode')}"
-        print(f"  [warn] Planner ({pname}) process returned exit code {res.get('returncode')}: {first_line}")
-    return subtasks
+        print(f"  [warn] Planner ({pname}) failed ({first_line})")
+        candidates = [c for c in cfg.get("roles", {}).get("planner", {}).get("providers", [])
+                      if c in avail and c not in tried]
+        if not candidates:
+            candidates = [c for c in avail if c not in tried]
+        pname = candidates[0] if candidates else None
+        if pname:
+            print(f"  [retry] Retrying planner with fallback provider '{pname}'...")
+    return None
 
 
 def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
@@ -1020,7 +1080,26 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
             project_root=str(outroot))
         status.log(f"build {s['id']} -> {pname}")
         status.agent_started(s["id"], pname)
+        print(f"  -> [{s['id']}] '{s['title']}' -> {pname}")
         res = run_agent(p, prompt, sdir, timeout, s["id"], models.get(role))
+
+        # Self-healing retry fallback if provider fails (unauthed CLI, crash, rate limit)
+        tried = {pname}
+        while res.get("returncode") != 0:
+            candidates = [c for c in cfg.get("roles", {}).get(role, {}).get("providers", [])
+                          if c in avail and c not in tried]
+            if not candidates:
+                candidates = [c for c in avail if c not in tried]
+            if not candidates:
+                break
+            fallback_name = candidates[0]
+            print(f"  [retry] [{s['id']}] '{pname}' failed (rc={res.get('returncode')}). Retrying with fallback '{fallback_name}'...")
+            status.log(f"retry {s['id']} -> {fallback_name}")
+            tried.add(fallback_name)
+            pname = fallback_name
+            p = avail[pname]
+            res = run_agent(p, prompt, sdir, timeout, s["id"], models.get(role))
+
         status.agent_finished(s["id"])
         meta_dir = outroot / "_meta" / s["id"]
         meta_dir.mkdir(parents=True, exist_ok=True)
@@ -1029,10 +1108,15 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
         (meta_dir / "result.json").write_text(
             json.dumps({"provider": pname, **res}, ensure_ascii=False), encoding="utf-8")
         ok = res["returncode"] == 0
+        if ok:
+            print(f"  [ok] [{s['id']}] completed via {pname} in {res.get('seconds', 0)}s")
+        else:
+            print(f"  [x]  [{s['id']}] failed via {pname} (rc={res['returncode']})")
         status.add_agent(s["id"], pname, "ok" if ok else f"rc={res['returncode']}",
                          res.get("seconds", 0), res.get("tokens", 0))
         return s["id"], res, pname
 
+    wave = 1
     while pending:
         batch = [s for s in plan
                  if s["id"] in pending
@@ -1044,6 +1128,7 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
                                      "seconds": 0, "tokens": 0}, "-")
                 del pending[s["id"]]
             break
+        print(f"\n[wave {wave}] Dispatching {len(batch)} parallel subtask(s)...")
         workers = min(max_parallel, len(batch))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(worker, s): s for s in batch}
@@ -1051,6 +1136,7 @@ def build_phase(cfg, avail, used, task, shared, outroot, plan, timeout,
                 sid, res, pname = fut.result()
                 results[sid] = (res, pname)
                 del pending[sid]
+        wave += 1
     return results
 
 
@@ -1064,6 +1150,7 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
         prompt = role_prompt(
             cfg, "reviewer", task=task, plan_path=str(shared / "plan.json"),
             shared=str(shared), outroot=str(outroot))
+        print(f"\n[review] Scrutinizing code with '{rname}' (Round {round_no}/2)...")
         status.log(f"review (round {round_no}) -> {rname}")
         status.agent_started(f"review r{round_no}", rname)
         res = run_agent(r, prompt, outroot, timeout, "reviewer", models.get("reviewer"))
@@ -1074,8 +1161,10 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
         (shared / f"review_{round_no}.json").write_text(
             json.dumps(issues, indent=2, ensure_ascii=False), encoding="utf-8")
         if not issues:
+            print("  [ok] Code review clean: no issues flagged.")
             status.log("review clean")
             break
+        print(f"  [!]  Code review flagged {len(issues)} issue(s).")
         status.log(f"review found {len(issues)} issue(s)")
         if hitl and workspace:
             decision = hitl_approval(issues, status, workspace)
@@ -1092,6 +1181,7 @@ def review_fix_loop(cfg, avail, used, task, shared, outroot, timeout, status,
         fprompt = role_prompt(
             cfg, "fixer", task=task, issues=json.dumps(issues, indent=2, ensure_ascii=False),
             shared=str(shared), outroot=str(outroot))
+        print(f"[fix]   Applying auto-fixes with '{fname}'...")
         status.log(f"fix -> {fname}")
         status.agent_started(f"fix r{round_no}", fname)
         run_agent(f, fprompt, outroot, timeout, "fixer", models.get("fixer"))
@@ -1730,6 +1820,7 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
         print(f"          - {s['id']}: {s['title']}  (depends: {deps})")
 
     # 2. BUILD (parallel waves by dependency) ------------------------------
+    print("\n[build] Starting build execution across agent swarm...")
     baseline = snapshot_tree(outroot)
     status.log(f"diff baseline captured: {len(baseline)} file(s)")
     results = build_phase(cfg, avail, used, task, shared, outroot, plan,
@@ -1744,6 +1835,7 @@ def run_pipeline(cfg, avail, task, workspace, args, timeout, max_parallel,
                                  workspace)
 
     # 4. REPORT ------------------------------------------------------------
+    print("\n[report] Generating audit report and unified code diffs...")
     status.set(phase="reporting")
     after = snapshot_tree(outroot)
     diffs = compute_diffs(baseline, after)
@@ -1798,7 +1890,10 @@ def check_report(cfg, det):
     desktop = desktop_apps()
     for name, p in det.items():
         if p["available"]:
-            print(f"  [ok]  {name:<10s} -> {p['path']}")
+            if not p.get("authenticated", True):
+                print(f"  [!]   {name:<10s} -> {p['path']} (unauthenticated: {p.get('auth_note')})")
+            else:
+                print(f"  [ok]  {name:<10s} -> {p['path']}")
         else:
             app = p.get("desktop_app")
             if app:

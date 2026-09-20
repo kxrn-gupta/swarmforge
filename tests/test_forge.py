@@ -124,7 +124,22 @@ class TestInvocation(unittest.TestCase):
     def test_build_command(self):
         provider = {"command": ["grok", "-p"], "approve_flags": ["--always-approve"], "model_flag": ["-m"], "model": "x"}
         cmd = build_command(provider, "hello")
-        self.assertEqual(cmd, ["grok", "-p", "--always-approve", "-m", "x", "hello"])
+        self.assertEqual(cmd, ["grok", "--always-approve", "-m", "x", "-p", "hello"])
+
+    def test_build_command_gemini(self):
+        provider = {"command": ["gemini", "-p"], "approve_flags": ["--yolo"], "model_flag": ["--model"], "model": "gemini-2.5-flash"}
+        cmd = build_command(provider, "hello")
+        self.assertEqual(cmd, ["gemini", "--yolo", "--model", "gemini-2.5-flash", "-p", "hello"])
+
+    def test_build_command_agy(self):
+        provider = {"command": ["agy", "-p"], "approve_flags": ["--dangerously-skip-permissions"]}
+        cmd = build_command(provider, "hello")
+        self.assertEqual(cmd, ["agy", "--dangerously-skip-permissions", "-p", "hello"])
+
+    def test_build_command_copilot(self):
+        provider = {"command": ["copilot", "-p"], "approve_flags": ["--yolo", "--no-ask-user"]}
+        cmd = build_command(provider, "hello")
+        self.assertEqual(cmd, ["copilot", "--yolo", "--no-ask-user", "-p", "hello"])
 
     def test_build_command_no_approve(self):
         provider = {"command": ["opencode", "run"], "approve": False}
@@ -321,12 +336,12 @@ class TestModelOverride(unittest.TestCase):
     def test_build_command_model_override(self):
         provider = {"command": ["grok", "-p"], "model_flag": ["-m"], "model": "default"}
         cmd = build_command(provider, "hello", model="grok-3-mini")
-        self.assertEqual(cmd, ["grok", "-p", "-m", "grok-3-mini", "hello"])
+        self.assertEqual(cmd, ["grok", "-m", "grok-3-mini", "-p", "hello"])
 
     def test_build_command_uses_provider_model_by_default(self):
         provider = {"command": ["grok", "-p"], "model_flag": ["-m"], "model": "default"}
         cmd = build_command(provider, "hello")
-        self.assertEqual(cmd, ["grok", "-p", "-m", "default", "hello"])
+        self.assertEqual(cmd, ["grok", "-m", "default", "-p", "hello"])
 
     def test_build_command_override_with_no_model_flag(self):
         provider = {"command": ["copilot", "-p"], "model_flag": [], "model": "x"}
@@ -713,6 +728,58 @@ class TestDashboard(unittest.TestCase):
             status = json.loads((ws / "status.json").read_text(encoding="utf-8"))
             self.assertIn("running", status)
             self.assertEqual(status["running"], [])
+
+
+class TestReliabilityAndAuth(unittest.TestCase):
+    def test_is_provider_authenticated_gemini_env(self):
+        from swarmforge import is_provider_authenticated
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}):
+            authed, note = is_provider_authenticated("gemini", {})
+            self.assertTrue(authed)
+            self.assertIn("GEMINI_API_KEY", note)
+
+    def test_is_provider_authenticated_copilot_env(self):
+        from swarmforge import is_provider_authenticated
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_fake"}, clear=True):
+            authed, note = is_provider_authenticated("copilot", {})
+            self.assertTrue(authed)
+            self.assertIn("GitHub token", note)
+
+    def test_build_phase_fallback_retry_on_failure(self):
+        from swarmforge import LiveStatus, build_phase
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            shared = tmp / "memory"
+            shared.mkdir()
+            outroot = tmp / "out"
+            outroot.mkdir()
+            (shared / "plan.json").write_text("[]", encoding="utf-8")
+            status = LiveStatus(tmp)
+
+            cfg = {
+                "roles": {
+                    "coder": {"providers": ["failing_prov", "working_prov"]}
+                }
+            }
+            avail = {
+                "failing_prov": {"command": ["mock_fail"], "approve_flags": []},
+                "working_prov": {"command": ["mock_ok"], "approve_flags": []}
+            }
+            used = {}
+            plan = [{"id": "t1", "role": "coder", "title": "Subtask 1", "depends": []}]
+
+            def fake_run_agent(p, prompt, cwd, timeout, name, model=None):
+                cmd = p.get("command", [])
+                if "mock_fail" in cmd:
+                    return {"name": name, "returncode": 1, "stdout": "", "stderr": "unauthenticated error", "seconds": 0.1, "tokens": 10}
+                return {"name": name, "returncode": 0, "stdout": "ok done", "stderr": "", "seconds": 0.2, "tokens": 20}
+
+            with mock.patch("swarmforge.run_agent", side_effect=fake_run_agent):
+                results = build_phase(cfg, avail, used, "Sample task", shared, outroot, plan,
+                                      timeout=30, max_parallel=2, status=status)
+                res, pname = results["t1"]
+                self.assertEqual(res["returncode"], 0)
+                self.assertEqual(pname, "working_prov")
 
 
 if __name__ == "__main__":
